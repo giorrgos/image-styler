@@ -1,0 +1,13 @@
+[project]
+name = "image-styler"
+version = "0.1.0"
+description = "AI-powered image styling with Streamlit"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit",
+    "openai",
+    "langfuse",
+    "python-dotenv",
+    "pillow",
+    "requests",
+]
