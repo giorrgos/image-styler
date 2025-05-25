@@ -50,17 +50,6 @@ uv streamlit run app.py
 - Streamlit
 - PIL/Pillow
 
-
-## Project Structure
-
-```
-image-styler/
-├── app.py              # Main Streamlit application
-├── requirements.txt    # Python dependencies
-├── README.md          # Project documentation
-└── styles/            # Style templates/models (if applicable)
-```
-
 ## Acknowledgments
 
 - Built with [Streamlit](https://streamlit.io/)
