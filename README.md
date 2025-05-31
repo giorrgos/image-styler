@@ -33,7 +33,7 @@ uv sync
 
 1. Start the Streamlit application:
 ```bash
-uv streamlit run app.py
+uv run streamlit run app.py
 ```
 
 2. Open your browser and navigate to `http://localhost:8501`
