@@ -6,8 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "streamlit",
     "replicate",
-    "langfuse",
     "python-dotenv",
     "pillow",
-    "requests",
+    "ipykernel>=6.29.5",
 ]
