@@ -1,6 +1,7 @@
 import streamlit as st
 import replicate
 import os
+import time
 from dotenv import load_dotenv
 from logger_config import setup_logger
 from image_generator import generate_styled_image
@@ -8,6 +9,16 @@ from image_utils import fix_image_orientation, pil_image_to_bytes
 
 # --- Logger Setup ---
 logger = setup_logger()
+
+# --- Initialize Telemetry (before everything else) ---
+try:
+    from telemetry_config import setup_telemetry, tracer, images_processed_counter, request_duration_histogram
+    TELEMETRY_ENABLED = setup_telemetry()
+    if TELEMETRY_ENABLED:
+        logger.info("Telemetry enabled and initialized")
+except ImportError:
+    TELEMETRY_ENABLED = False
+    logger.warning("Telemetry not available - running without instrumentation")
 
 # --- Environment and Model Setup ---
 load_dotenv()
@@ -33,6 +44,47 @@ except Exception as e:
 logger.info("Application started")
 st.set_page_config(page_title="Image Styler", layout="wide")
 st.title("Giorgos' Styling Salon")
+
+def _process_image_request(corrected_image, uploaded_file, prompt, model, 
+                          api_token, col2, span, request_start_time):
+    """Process the image styling request with optional telemetry."""
+    with st.spinner("Generating your image..."):
+        # Convert corrected PIL image to bytes for API
+        if corrected_image:
+            image_bytes = pil_image_to_bytes(corrected_image)
+            success, image_url, error_message = generate_styled_image(prompt, image_bytes, model, api_token)
+        else:
+            success, image_url, error_message = generate_styled_image(prompt, uploaded_file, model, api_token)
+        
+        # Calculate total request duration
+        request_duration = time.time() - request_start_time
+        
+        if success:
+            with col2:
+                st.image(image_url, caption="Styled Image", use_container_width=True)
+            
+            # Record success metrics
+            if span:
+                span.set_attribute("success", True)
+                span.set_attribute("duration_seconds", request_duration)
+            
+            if TELEMETRY_ENABLED:
+                images_processed_counter.add(1, {"model": model, "status": "success"})
+                request_duration_histogram.record(request_duration, {"model": model, "status": "success"})
+        else:
+            if error_message and error_message.startswith("Please"):
+                st.warning(error_message)
+            else:
+                st.error(error_message)
+            
+            # Record failure metrics
+            if span:
+                span.set_attribute("success", False)
+                span.set_attribute("error_message", error_message)
+                span.set_attribute("duration_seconds", request_duration)
+            
+            if TELEMETRY_ENABLED:
+                request_duration_histogram.record(request_duration, {"model": model, "status": "failure"})
 
 # --- File uploader at the top ---
 uploaded_file = st.file_uploader("Upload an image", type=["jpg", "png", "jpeg"], key="uploader")
@@ -78,19 +130,27 @@ prompt = st.text_input("Enter a style prompt (e.g. 'cyberpunk style portrait', '
 
 # --- "Generate Styled Image" button below the prompt ---
 if st.button("Generate Styled Image"):
-    with st.spinner("Generating your image..."):
-        # Convert corrected PIL image to bytes for API
-        if corrected_image:
-            image_bytes = pil_image_to_bytes(corrected_image)
-            success, image_url, error_message = generate_styled_image(prompt, image_bytes, MODEL, REPLICATE_API_TOKEN)
-        else:
-            success, image_url, error_message = generate_styled_image(prompt, uploaded_file, MODEL, REPLICATE_API_TOKEN)
-        
-        if success:
-            with col2:
-                st.image(image_url, caption="Styled Image", use_container_width=True)
-        else:
-            if error_message and error_message.startswith("Please"):
-                st.warning(error_message)
-            else:
-                st.error(error_message)
+    # Create root span for the entire request
+    request_start_time = time.time()
+    
+    if TELEMETRY_ENABLED:
+        with tracer.start_as_current_span("image_styling_request") as span:
+            # Add request metadata
+            span.set_attribute("has_file", corrected_image is not None)
+            span.set_attribute("has_prompt", bool(prompt))
+            span.set_attribute("model", MODEL)
+            
+            if uploaded_file:
+                span.set_attribute("filename", uploaded_file.name)
+                span.set_attribute("file_size_mb", uploaded_file.size / (1024 * 1024))
+                span.set_attribute("file_type", uploaded_file.type)
+            
+            _process_image_request(
+                corrected_image, uploaded_file, prompt, MODEL, 
+                REPLICATE_API_TOKEN, col2, span, request_start_time
+            )
+    else:
+        _process_image_request(
+            corrected_image, uploaded_file, prompt, MODEL,
+            REPLICATE_API_TOKEN, col2, None, request_start_time
+        )

@@ -2,10 +2,24 @@
 Image generation module for the Image Styler application.
 Handles all Replicate API interactions for image styling.
 """
+import time
 import replicate
 from logger_config import setup_logger
 
 logger = setup_logger()
+
+# Import telemetry after logger to avoid circular imports
+try:
+    from telemetry_config import (
+        tracer, 
+        api_calls_counter, 
+        api_errors_counter,
+        api_duration_histogram
+    )
+    TELEMETRY_ENABLED = True
+except ImportError:
+    TELEMETRY_ENABLED = False
+    logger.warning("Telemetry not available - running without instrumentation")
 
 
 def generate_styled_image(prompt, uploaded_file, model, api_token):
@@ -21,12 +35,31 @@ def generate_styled_image(prompt, uploaded_file, model, api_token):
     Returns:
         tuple: (success: bool, result: str or None, error_message: str or None)
     """
+    if TELEMETRY_ENABLED:
+        with tracer.start_as_current_span("replicate_api_call") as span:
+            span.set_attribute("model", model)
+            span.set_attribute("prompt_length", len(prompt) if prompt else 0)
+            return _generate_styled_image_impl(prompt, uploaded_file, model, api_token, span)
+    else:
+        return _generate_styled_image_impl(prompt, uploaded_file, model, api_token, None)
+
+
+def _generate_styled_image_impl(prompt, uploaded_file, model, api_token, span=None):
+    """Implementation of image generation with optional telemetry."""
+    start_time = time.time()
+    
     if not uploaded_file:
         logger.warning("Image generation attempted without an uploaded file.")
+        if span:
+            span.set_attribute("error", True)
+            span.set_attribute("error_type", "no_file")
         return False, None, "Please upload an image first."
     
     if not prompt:
         logger.warning("Image generation attempted without a prompt.")
+        if span:
+            span.set_attribute("error", True)
+            span.set_attribute("error_type", "no_prompt")
         return False, None, "Please enter a prompt."
     
     try:
@@ -36,6 +69,10 @@ def generate_styled_image(prompt, uploaded_file, model, api_token):
         # Log model and prompt details
         logger.info(f"Calling Replicate API. Model: {model}, Prompt: '{prompt}'")
         
+        # Record API call attempt
+        if TELEMETRY_ENABLED:
+            api_calls_counter.add(1, {"model": model, "status": "attempted"})
+        
         api_output = replicate.run(
             model,
             input={
@@ -43,6 +80,11 @@ def generate_styled_image(prompt, uploaded_file, model, api_token):
                 "input_image": uploaded_file,
             }
         )
+        
+        # Calculate duration
+        duration = time.time() - start_time
+        if TELEMETRY_ENABLED:
+            api_duration_histogram.record(duration, {"model": model})
         
         styled_image_url = None
         if api_output:
@@ -52,15 +94,58 @@ def generate_styled_image(prompt, uploaded_file, model, api_token):
         
         if styled_image_url:
             logger.info(f"Successfully generated styled image. URL: {styled_image_url}")
+            
+            if span:
+                span.set_attribute("success", True)
+                span.set_attribute("duration_seconds", duration)
+            
+            if TELEMETRY_ENABLED:
+                api_calls_counter.add(1, {"model": model, "status": "success"})
+            
             return True, styled_image_url, None
         else:
             logger.warning(f"Image generation did not return a valid URL. API output: {api_output}")
             error_msg = f"Image generation returned an unexpected result. Output: {api_output}" if api_output else "Image generation failed and no output was received."
+            
+            if span:
+                span.set_attribute("success", False)
+                span.set_attribute("error_type", "invalid_output")
+            
+            if TELEMETRY_ENABLED:
+                api_errors_counter.add(1, {"model": model, "error_type": "invalid_output"})
+            
             return False, None, error_msg
             
     except replicate.exceptions.ReplicateError as e:
+        duration = time.time() - start_time
         logger.error(f"Replicate API call unsuccessful: {e}", exc_info=True)
+        
+        if span:
+            span.set_attribute("success", False)
+            span.set_attribute("error", True)
+            span.set_attribute("error_type", "replicate_error")
+            span.set_attribute("error_message", str(e))
+            span.set_attribute("duration_seconds", duration)
+        
+        if TELEMETRY_ENABLED:
+            api_errors_counter.add(1, {"model": model, "error_type": "replicate_error"})
+            api_duration_histogram.record(duration, {"model": model})
+        
         return False, None, f"Replicate API Error: {e}"
+    
     except Exception as e:
+        duration = time.time() - start_time
         logger.error(f"An unexpected error occurred during image generation: {e}", exc_info=True)
+        
+        if span:
+            span.set_attribute("success", False)
+            span.set_attribute("error", True)
+            span.set_attribute("error_type", "unexpected_error")
+            span.set_attribute("error_message", str(e))
+            span.set_attribute("duration_seconds", duration)
+        
+        if TELEMETRY_ENABLED:
+            api_errors_counter.add(1, {"model": model, "error_type": "unexpected_error"})
+            api_duration_histogram.record(duration, {"model": model})
+        
         return False, None, f"An unexpected error occurred: {e}"
