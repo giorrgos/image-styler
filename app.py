@@ -23,7 +23,11 @@ except ImportError:
 # --- Environment and Model Setup ---
 load_dotenv()
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-MODEL = "black-forest-labs/flux-kontext-pro"
+
+AVAILABLE_MODELS = {
+    "Flux Kontext Pro": "black-forest-labs/flux-kontext-pro",
+    "Qwen Image Edit Plus": "qwen/qwen-image-edit-plus",
+}
 
 # Validate configuration
 if not REPLICATE_API_TOKEN:
@@ -85,6 +89,14 @@ def _process_image_request(corrected_image, uploaded_file, prompt, model,
             
             if TELEMETRY_ENABLED:
                 request_duration_histogram.record(request_duration, {"model": model, "status": "failure"})
+
+# --- Model selector ---
+selected_model_name = st.radio(
+    "Select model",
+    options=list(AVAILABLE_MODELS.keys()),
+    horizontal=True,
+)
+MODEL = AVAILABLE_MODELS[selected_model_name]
 
 # --- File uploader at the top ---
 uploaded_file = st.file_uploader("Upload an image", type=["jpg", "png", "jpeg"], key="uploader")

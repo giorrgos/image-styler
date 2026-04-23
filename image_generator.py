@@ -69,27 +69,27 @@ def _generate_styled_image_impl(prompt, uploaded_file, model, api_token, span=No
         # Log model and prompt details
         logger.info(f"Calling Replicate API. Model: {model}, Prompt: '{prompt}'")
         
-        # Record API call attempt
-        if TELEMETRY_ENABLED:
-            api_calls_counter.add(1, {"model": model, "status": "attempted"})
-        
-        api_output = replicate.run(
-            model,
-            input={
-                "prompt": prompt,
-                "input_image": uploaded_file,
-            }
-        )
-        
+        # Build input payload based on model's expected parameter names
+        if model.startswith("qwen/"):
+            model_input = {"prompt": prompt, "image": [uploaded_file]}
+        else:
+            model_input = {"prompt": prompt, "input_image": uploaded_file}
+
+        api_output = replicate.run(model, input=model_input)
+
         # Calculate duration
         duration = time.time() - start_time
         if TELEMETRY_ENABLED:
             api_duration_histogram.record(duration, {"model": model})
-        
+
+        # flux returns a single URI string; qwen returns a list of URIs
         styled_image_url = None
         if api_output:
-            url_candidate = str(api_output)
-            if url_candidate.startswith("http"):
+            if isinstance(api_output, list):
+                url_candidate = str(api_output[0]) if api_output else None
+            else:
+                url_candidate = str(api_output)
+            if url_candidate and url_candidate.startswith("http"):
                 styled_image_url = url_candidate
         
         if styled_image_url:
@@ -112,39 +112,42 @@ def _generate_styled_image_impl(prompt, uploaded_file, model, api_token, span=No
                 span.set_attribute("error_type", "invalid_output")
             
             if TELEMETRY_ENABLED:
+                api_calls_counter.add(1, {"model": model, "status": "failure"})
                 api_errors_counter.add(1, {"model": model, "error_type": "invalid_output"})
-            
+
             return False, None, error_msg
-            
+
     except replicate.exceptions.ReplicateError as e:
         duration = time.time() - start_time
         logger.error(f"Replicate API call unsuccessful: {e}", exc_info=True)
-        
+
         if span:
             span.set_attribute("success", False)
             span.set_attribute("error", True)
             span.set_attribute("error_type", "replicate_error")
             span.set_attribute("error_message", str(e))
             span.set_attribute("duration_seconds", duration)
-        
+
         if TELEMETRY_ENABLED:
+            api_calls_counter.add(1, {"model": model, "status": "failure"})
             api_errors_counter.add(1, {"model": model, "error_type": "replicate_error"})
             api_duration_histogram.record(duration, {"model": model})
-        
+
         return False, None, f"Replicate API Error: {e}"
-    
+
     except Exception as e:
         duration = time.time() - start_time
         logger.error(f"An unexpected error occurred during image generation: {e}", exc_info=True)
-        
+
         if span:
             span.set_attribute("success", False)
             span.set_attribute("error", True)
             span.set_attribute("error_type", "unexpected_error")
             span.set_attribute("error_message", str(e))
             span.set_attribute("duration_seconds", duration)
-        
+
         if TELEMETRY_ENABLED:
+            api_calls_counter.add(1, {"model": model, "status": "failure"})
             api_errors_counter.add(1, {"model": model, "error_type": "unexpected_error"})
             api_duration_histogram.record(duration, {"model": model})
         

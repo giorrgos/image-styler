@@ -6,7 +6,8 @@ A Streamlit web application that allows you to upload images and apply various a
 
 - 📸 **Image Upload**: Support for common image formats (JPG, PNG, JPEG)
 - 🔄 **EXIF Orientation**: Automatically fixes image orientation
-- 🎨 **AI Style Transfer**: Apply artistic styles using FLUX models from Replicate
+- 🎨 **AI Style Transfer**: Apply artistic styles using AI models from Replicate (FLUX Kontext Pro, Qwen Image Edit Plus)
+- 🔀 **Model Toggle**: Switch between image models directly in the UI
 - 🖼️ **Real-time Preview**: See both original and styled images side by side
 - 📊 **Full Observability**: Distributed tracing, metrics, and logging with Grafana stack
 - � **Performance Monitoring**: Track API call durations, error rates, and request flows
@@ -29,7 +30,10 @@ image-styler/
     ├── prometheus.yml
     ├── tempo.yml
     └── grafana/
-        └── datasources.yml
+        ├── datasources.yml
+        ├── dashboards.yml
+        └── dashboards/
+            └── image-styler-dashboard.json
 ```
 
 ## Prerequisites
@@ -104,8 +108,7 @@ uv run streamlit run app.py
 #### Access the Services
 
 - **Application**: [http://localhost:8502](http://localhost:8502) (or check terminal output for actual port)
-- **Grafana Dashboard**: [http://localhost:3000/d/image-styler-overview](http://localhost:3000/d/image-styler-overview)
-- **Grafana**: [http://localhost:3000](http://localhost:3000) (auto-login enabled)
+- **Grafana Dashboard**: [http://localhost:3000/d/image-styler-overview](http://localhost:3000/d/image-styler-overview) (auto-login enabled)
 - **Prometheus**: [http://localhost:9090](http://localhost:9090)
 
 #### Using Grafana Dashboard
@@ -161,56 +164,143 @@ The app will detect that telemetry services aren't available and run without ins
 
 ---
 
-## Observability Details
+## Observability
 
-### Traces (Tempo)
-
-The application creates the following trace spans for each request:
+### How the Stack Fits Together
 
 ```
-image_styling_request (root)
-├── fix_orientation
-└── replicate_api_call
+┌─────────────────────────────────────────────────────────────┐
+│                     Streamlit App                           │
+│  Generates traces + metrics via OpenTelemetry SDK           │
+└────────────────────┬────────────────────────────────────────┘
+                     │ OTLP gRPC (localhost:4317)
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│               OpenTelemetry Collector                       │
+│  Receives all telemetry and fans it out:                    │
+│    traces  ──► OTLP export ──► Tempo                       │
+│    metrics ──► Prometheus exporter on :8889                 │
+└────────────────────┬───────────────────┬────────────────────┘
+                     │                   │
+          OTLP gRPC  │                   │ Prometheus scrapes :8889
+                     ▼                   ▼
+              ┌──────────┐        ┌─────────────┐
+              │  Tempo   │        │ Prometheus  │
+              │ (traces) │        │  (metrics)  │
+              └────┬─────┘        └──────┬──────┘
+                   │                     │
+                   └──────────┬──────────┘
+                              ▼
+                       ┌─────────┐
+                       │ Grafana │
+                       │ queries │
+                       │  both   │
+                       └─────────┘
 ```
 
-**Span Attributes**:
-- `filename`, `file_size_mb`, `file_type`
-- `model`, `prompt_length`
-- `orientation_fixed`, `success`
-- `duration_seconds`, `error_message` (if failed)
+Each image generation request produces:
+- **One trace** with three spans: `image_styling_request` → `fix_orientation` + `replicate_api_call`
+- **Metrics increments**: `api_calls_total`, `api_call_duration_seconds`, `images_processed_total`
 
-### Metrics (Prometheus)
+---
 
-**The 4 Essential Metrics** (displayed in Grafana dashboard):
+### OpenTelemetry Collector
 
-1. **API Success Rate**
-   - Query: `sum(rate(image_styler_api_calls_total{status="success"}[5m])) / sum(rate(image_styler_api_calls_total[5m])) * 100`
-   - Shows: Percentage of successful API calls
-   - Target: > 95%
+The collector is the central hub. It receives everything the app sends and routes it:
+- **Traces** → forwarded via OTLP to Tempo for storage
+- **Metrics** → exposed as a Prometheus scrape endpoint on `:8889`; Prometheus pulls from there every 15 seconds
 
-2. **Total API Calls**
-   - Query: `sum(image_styler_api_calls_total)`
-   - Shows: Total number of API calls since app started
-   - Use: Track overall usage
+The collector also adds the `image_styler_` namespace prefix to all metric names, which is why Prometheus metrics appear as `image_styler_api_calls_total` rather than just `api_calls_total`.
 
-3. **Average API Call Duration**
-   - Query: `rate(image_styler_api_call_duration_seconds_sum[5m]) / rate(image_styler_api_call_duration_seconds_count[5m])`
-   - Shows: Average time for API calls in seconds
-   - Target: < 15 seconds
+Check collector logs if data is missing:
+```bash
+docker-compose logs -f otel-collector
+```
 
-4. **Total Errors**
-   - Query: `sum(image_styler_api_errors_total)`
-   - Shows: Total number of errors since app started
-   - Target: 0
+---
 
-**Additional Metrics Available**:
-- `images_processed_total` - Total images processed by model and status
-- `api_calls_total` - Total API calls by model and status
-- `api_errors_total` - Total API errors by error type
-- `api_call_duration_seconds` - API response time histogram
-- `request_duration_seconds` - End-to-end request duration histogram
+### Tempo (Distributed Traces)
 
-**For More Queries**: See `PROMETHEUS_QUERIES.md` and `METRICS_QUICK_START.md` for detailed examples and usage.
+Tempo stores request traces. Each trace shows the full lifecycle of one image generation — how long orientation fixing took, how long the Replicate API call took, and whether it succeeded.
+
+**Access traces in Grafana:**
+1. Go to [http://localhost:3000](http://localhost:3000) → **Explore** (compass icon)
+2. Select **Tempo** as the datasource
+3. Set **Query type** to `Search`, filter by service name `image-styler`
+4. Click a trace to expand the span waterfall
+
+**Span attributes recorded per request:**
+
+| Span | Attributes |
+|------|-----------|
+| `image_styling_request` | `filename`, `file_size_mb`, `file_type`, `has_prompt`, `model` |
+| `fix_orientation` | `orientation_fixed`, `image_width`, `image_height` |
+| `replicate_api_call` | `model`, `prompt_length`, `success`, `duration_seconds`, `error_message` |
+
+---
+
+### Prometheus (Metrics)
+
+Prometheus stores time-series metrics. Access the UI at [http://localhost:9090](http://localhost:9090) to run ad-hoc queries, or check [http://localhost:9090/targets](http://localhost:9090/targets) to confirm the collector scrape target is `UP`.
+
+**Metrics emitted by the app** (all prefixed `image_styler_` by the collector):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `image_styler_api_calls_total` | Counter | `model`, `status` (`success`/`failure`) | Completed API calls |
+| `image_styler_api_errors_total` | Counter | `model`, `error_type` | API errors by type |
+| `image_styler_api_call_duration_seconds` | Histogram | `model` | Replicate API response time |
+| `image_styler_images_processed_total` | Counter | `model`, `status` | Images processed end-to-end |
+| `image_styler_request_duration_seconds` | Histogram | `model`, `status` | Full request duration |
+
+**Sample queries** (paste into [http://localhost:9090](http://localhost:9090) or Grafana Explore → Prometheus):
+
+```promql
+# Success rate over the last 5 minutes (%)
+sum(rate(image_styler_api_calls_total{status="success"}[5m]))
+  / sum(rate(image_styler_api_calls_total[5m])) * 100
+
+# Average Replicate API response time (seconds)
+rate(image_styler_api_call_duration_seconds_sum[5m])
+  / rate(image_styler_api_call_duration_seconds_count[5m])
+
+# Call volume split by model
+sum by (model) (rate(image_styler_api_calls_total[5m]))
+
+# Error breakdown by type
+sum by (error_type) (image_styler_api_errors_total)
+
+# 95th percentile API duration
+histogram_quantile(0.95, rate(image_styler_api_call_duration_seconds_bucket[5m]))
+```
+
+For the full query reference see `PROMETHEUS_QUERIES.md`.
+
+---
+
+### Grafana (Visualisation)
+
+Grafana is pre-provisioned with both datasources (Prometheus and Tempo) and the Image Styler dashboard. No login required.
+
+**Pre-built dashboard** — [http://localhost:3000/d/image-styler-overview](http://localhost:3000/d/image-styler-overview):
+
+```
+┌──────────────────────┬──────────────────────┐
+│   API Success Rate   │   Total API Calls    │
+│   (gauge, target     │   (stat counter)     │
+│    ≥ 95%)            │                      │
+├──────────────────────┼──────────────────────┤
+│ Avg API Duration     │   Total Errors       │
+│ (time series graph)  │   (stat counter)     │
+└──────────────────────┴──────────────────────┘
+```
+
+**To explore traces from Grafana:**
+1. **Explore** → select **Tempo** → query by service `image-styler`
+2. Click any trace row to open the span waterfall
+
+**To run custom metric queries from Grafana:**
+1. **Explore** → select **Prometheus** → paste any PromQL query above
 
 ---
 
@@ -276,12 +366,14 @@ docker-compose down
 
 ### Useful URLs
 
-- **Application**: http://localhost:8502 (check terminal for actual port)
-- **Grafana Dashboard**: http://localhost:3000/d/image-styler-overview
-- **Grafana Home**: http://localhost:3000
-- **Prometheus**: http://localhost:9090
-- **Prometheus Targets**: http://localhost:9090/targets
-- **OTEL Collector Metrics**: http://localhost:8889/metrics
+| Service | URL | Purpose |
+|---------|-----|---------|
+| Application | http://localhost:8502 | Streamlit app (check terminal for actual port) |
+| Grafana Dashboard | http://localhost:3000/d/image-styler-overview | Pre-built metrics dashboard |
+| Grafana Explore | http://localhost:3000/explore | Ad-hoc traces and metric queries |
+| Prometheus | http://localhost:9090 | Raw metric queries |
+| Prometheus Targets | http://localhost:9090/targets | Verify scrape targets are UP |
+| OTEL Collector Metrics | http://localhost:8889/metrics | Raw metrics before Prometheus scrapes |
 
 ### Documentation Files
 
